@@ -1,0 +1,16 @@
+{
+  "table_rules": {
+    "SalesData": {
+      "description": "Transactional e-commerce retail records.",
+      "default_filters": [
+        "Exclude cancelled invoices where \"InvoiceNo\" LIKE 'C%' unless the user explicitly asks for cancellations or returns.",
+        "Exclude invalid/return rows where \"Quantity\" <= 0 or \"UnitPrice\" <= 0 when computing revenue or sales volume."
+      ],
+      "metrics": {
+        "Net Revenue": "SUM(\"Quantity\" * \"UnitPrice\") WHERE \"Quantity\" > 0 AND \"UnitPrice\" > 0 AND \"InvoiceNo\" NOT LIKE 'C%'",
+        "Return Rate": "COUNT(CASE WHEN \"InvoiceNo\" LIKE 'C%' OR \"Quantity\" < 0 THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0)",
+        "Average Order Value (AOV)": "SUM(\"Quantity\" * \"UnitPrice\") / NULLIF(COUNT(DISTINCT \"InvoiceNo\"), 0)"
+      }
+    }
+  }
+}
