@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import duckdb
 import pandas as pd
 import numpy as np
 import scipy.stats as stats
@@ -113,7 +114,7 @@ st.markdown(
 )
 
 # ---------------------------------------------------------
-# Security AST Guardrail & Pre-Flight Intent Filter
+# Security AST Guardrail, Pre-Flight Filter & PII Masking
 # ---------------------------------------------------------
 class SQLGuardrail:
     FORBIDDEN_OPERATIONS = (
@@ -164,6 +165,43 @@ class SQLGuardrail:
             return None, f"AST Syntax Parse Error: {str(e)}"
         except Exception as e:
             return None, f"Guardrail Error: {str(e)}"
+
+
+class PIIMasker:
+    SENSITIVE_COL_PATTERN = re.compile(
+        r"(email|e_mail|phone|mobile|ssn|social_security|password|passwd|secret|token|credit_card|card_num|address)",
+        re.IGNORECASE,
+    )
+    EMAIL_REGEX = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+    PHONE_REGEX = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")
+
+    @classmethod
+    def mask_dataframe(cls, df: pd.DataFrame):
+        if df is None or df.empty:
+            return df, []
+
+        masked_df = df.copy()
+        masked_cols = []
+
+        for col in masked_df.columns:
+            # 1. Redact entire column if column name is sensitive
+            if cls.SENSITIVE_COL_PATTERN.search(str(col)):
+                masked_df[col] = "[REDACTED]"
+                masked_cols.append(col)
+                continue
+
+            # 2. Scan text columns for inline emails or phone numbers
+            if masked_df[col].dtype == "object":
+                series_str = masked_df[col].astype(str)
+                has_email = series_str.str.contains(cls.EMAIL_REGEX, na=False).any()
+                has_phone = series_str.str.contains(cls.PHONE_REGEX, na=False).any()
+                if has_email or has_phone:
+                    series_str = series_str.str.replace(cls.EMAIL_REGEX, "[EMAIL_REDACTED]", regex=True)
+                    series_str = series_str.str.replace(cls.PHONE_REGEX, "[PHONE_REDACTED]", regex=True)
+                    masked_df[col] = series_str
+                    masked_cols.append(col)
+
+        return masked_df, masked_cols
 
 # ---------------------------------------------------------
 # Semantic Business Rules Layer
@@ -270,7 +308,7 @@ def initialize_gemini():
         return genai.GenerativeModel("gemini-1.5-flash"), "gemini-1.5-flash"
 
 # ---------------------------------------------------------
-# Database Engine & Schema Inspector
+# Database Engine, Schema Inspector & DuckDB Federation
 # ---------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_db_engine(uri: str):
@@ -283,16 +321,66 @@ def get_db_engine(uri: str):
         },
     )
 
-def fetch_schema_context(engine) -> str:
+def fetch_schema_context(engine, prefix: str = "") -> str:
     inspector = inspect(engine)
     schema_details = []
     for table_name in inspector.get_table_names():
         columns = inspector.get_columns(table_name)
         col_strs = [f"{col['name']} ({str(col['type'])})" for col in columns]
-        schema_details.append(f"Table '{table_name}': {', '.join(col_strs)}")
+        qualified_name = f'{prefix}"{table_name}"' if prefix else f'"{table_name}"'
+        schema_details.append(f"PostgreSQL Table {qualified_name}: {', '.join(col_strs)}")
     return "\n".join(schema_details)
 
-def execute_query(engine, sql: str):
+
+class FederatedEngine:
+    """
+    In-memory DuckDB workspace that attaches Supabase PostgreSQL (read-only)
+    and registers uploaded CSV/Excel files for unified SQL joins.
+    """
+    def __init__(self, pg_uri: str):
+        self.con = duckdb.connect(database=":memory:")
+        self.pg_attached = False
+        self.uploaded_tables = {}
+
+        if pg_uri:
+            try:
+                self.con.execute("INSTALL postgres; LOAD postgres;")
+                self.con.execute(
+                    f"ATTACH '{pg_uri}' AS pg (TYPE postgres, READ_ONLY, SCHEMA 'public');"
+                )
+                self.pg_attached = True
+            except Exception as e:
+                st.sidebar.warning(f"DuckDB Postgres attach warning: {e}")
+
+    def register_dataframe(self, filename: str, df: pd.DataFrame) -> str:
+        clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", filename.rsplit(".", 1)[0]).lower()
+        self.con.register(clean_name, df)
+        self.uploaded_tables[clean_name] = df
+        return clean_name
+
+    def get_uploaded_schema(self) -> str:
+        if not self.uploaded_tables:
+            return ""
+        lines = []
+        for name, df in self.uploaded_tables.items():
+            cols = [f"{col} ({dtype})" for col, dtype in df.dtypes.items()]
+            lines.append(f"Local Uploaded Table '{name}': {', '.join(cols)}")
+        return "\n".join(lines)
+
+    def execute(self, sql: str):
+        try:
+            df = self.con.execute(sql).df()
+            return df, None
+        except Exception as e:
+            return None, str(e)
+
+
+def execute_query(engine, sql: str, fed_engine: FederatedEngine = None):
+    """
+    Routes execution to DuckDB when local files are federated, otherwise PostgreSQL.
+    """
+    if fed_engine is not None and fed_engine.uploaded_tables:
+        return fed_engine.execute(sql)
     try:
         with engine.connect() as conn:
             df = pd.read_sql(text(sql), conn)
@@ -304,14 +392,23 @@ def execute_query(engine, sql: str):
 # Specialized Multi-Agent System
 # ---------------------------------------------------------
 class SQLAgent:
-    def __init__(self, model, schema_context: str, semantic_context: str = ""):
+    def __init__(self, model, schema_context: str, semantic_context: str = "", federated: bool = False):
         self.model = model
         self.schema = schema_context
         self.semantic_context = semantic_context
+        self.federated = federated
 
-    def generate_and_verify(self, user_prompt: str, engine, history: list, max_retries: int = 3):
+    def generate_and_verify(self, user_prompt: str, engine, history: list, fed_engine=None, max_retries: int = 3):
         if not self.model:
             return None, "", "Gemini API client is not initialized.", {}
+
+        target_dialect = "duckdb" if self.federated else "postgres"
+        dialect_note = (
+            "Target DuckDB SQL syntax. Reference PostgreSQL tables with the `pg.` prefix (e.g., `pg.\"SalesData\"`) "
+            "and local uploaded tables directly by their table name."
+            if self.federated
+            else "Target PostgreSQL syntax. Wrap case-sensitive identifiers in double quotes."
+        )
 
         error_context = ""
         history_context = ""
@@ -320,8 +417,8 @@ class SQLAgent:
                 history_context += f"User: {turn.get('question', '')}\nGenerated SQL: {turn.get('sql', '')}\n"
 
         for attempt in range(max_retries):
-            prompt = f"""You are an enterprise PostgreSQL senior architect.
-Database Schema:
+            prompt = f"""You are an enterprise SQL senior architect.
+Available Schema:
 {self.schema}
 
 Semantic Business Rules (MUST BE OBEYED):
@@ -335,7 +432,7 @@ User Task: "{user_prompt}"
 
 Rules:
 1. Write a read-only SELECT or UNION query that strictly solves the user task and obeys the Semantic Business Rules.
-2. Target PostgreSQL syntax. Wrap case-sensitive identifiers in double quotes.
+2. {dialect_note}
 3. Return ONLY a valid JSON object with the exact keys:
 {{
   "sql": "SELECT ...",
@@ -368,17 +465,17 @@ Do not wrap the JSON in markdown fences or add commentary.
                     raw_sql = raw_sql[raw_sql.upper().find("SELECT"):]
 
                 # 1. AST Guardrail Verification
-                sanitized_sql, guardrail_err = SQLGuardrail.validate_and_sanitize(raw_sql, target_dialect="postgres")
+                sanitized_sql, guardrail_err = SQLGuardrail.validate_and_sanitize(raw_sql, target_dialect=target_dialect)
                 if guardrail_err:
                     error_context = f"\nPrevious attempt blocked by AST Guardrail: {guardrail_err}. Fix the SQL."
                     continue
 
-                # 2. Database Execution Test
-                df, db_err = execute_query(engine, sanitized_sql)
+                # 2. Database / DuckDB Execution Test
+                df, db_err = execute_query(engine, sanitized_sql, fed_engine=fed_engine)
                 if not db_err:
                     return df, sanitized_sql, None, metadata
                 else:
-                    error_context = f"\nPrevious attempt failed with Database Error: {db_err}. Fix the SQL."
+                    error_context = f"\nPrevious attempt failed with Execution Error: {db_err}. Fix the SQL."
 
             except Exception as e:
                 error_context = f"\nAPI or Pipeline Exception: {str(e)}"
@@ -391,7 +488,8 @@ class VisualizationAgent:
         self.model = model
 
     def generate_figure(self, user_prompt: str, df: pd.DataFrame):
-        if not self.model or df.empty or len(df.columns) < 2:
+        # Skip visualization on empty, single-column, or non-numeric tables (saves API quota)
+        if not self.model or df.empty or len(df.columns) < 2 or df.select_dtypes(include=[np.number]).empty:
             return None
 
         df_head_str = df.head(3).to_dict(orient="records")
@@ -445,51 +543,26 @@ Rules:
 
 
 class InsightAgent:
-    def __init__(self, model, schema_context: str):
+    def __init__(self, model, schema_context: str, federated: bool = False):
         self.model = model
         self.schema = schema_context
+        self.federated = federated
 
-    def generate_insight_stream(self, user_prompt: str, original_sql: str, df: pd.DataFrame, engine):
+    def generate_insight_stream(self, user_prompt: str, original_sql: str, df: pd.DataFrame):
         if not self.model or df.empty:
             yield "No tabular data returned for analytical evaluation."
             return
 
-        # 1. Run Statistical Diagnostics
+        # 1. Run Statistical Diagnostics (local, zero API calls)
         stats_data = StatisticalDiagnosticsEngine.run_diagnostics(df)
         stats_str = f"\nEmpirical Statistical Diagnostics:\n{stats_data}" if stats_data else ""
 
-        # 2. Autonomous Secondary Deep-Dive Query
-        secondary_summary = ""
-        try:
-            deep_dive_prompt = f"""Given this user question: "{user_prompt}"
-Database Schema: {self.schema}
-Primary SQL executed: {original_sql}
-
-Suggest 1 secondary complementary SQL SELECT query that provides broader baseline metrics (e.g., overall average, totals, or standard deviation) to enrich the primary answer.
-Output strictly the SQL query or 'NONE'."""
-            res = self.model.generate_content(
-                deep_dive_prompt,
-                generation_config={"temperature": 0.0},
-                request_options={"timeout": 15},
-            )
-            sec_sql = res.text.strip().replace("```sql", "").replace("```", "").strip()
-
-            if "SELECT" in sec_sql.upper():
-                sanitized_sec, err = SQLGuardrail.validate_and_sanitize(sec_sql, target_dialect="postgres")
-                if not err:
-                    sec_df, sec_err = execute_query(engine, sanitized_sec)
-                    if not sec_err and not sec_df.empty:
-                        secondary_summary = f"\nSecondary Context Data:\n{sec_df.head(3).to_string(index=False)}"
-        except Exception:
-            secondary_summary = ""
-
-        # 3. Stream Synthesis
+        # 2. Stream Synthesis (single LLM call; deep dives handled on-demand by RootCauseAgent)
         synthesis_prompt = f"""You are a Lead Quantitative Data Scientist.
 User Query: "{user_prompt}"
 Executed SQL: {original_sql}
 Primary Data Sample:
 {df.head(5).to_string(index=False)}
-{secondary_summary}
 {stats_str}
 
 Provide a concise, publication-grade analytical interpretation (2-3 paragraphs max). 
@@ -510,12 +583,13 @@ Directly cite identified statistical metrics, anomalies, or correlations where a
 
 
 class RootCauseAgent:
-    def __init__(self, model, schema_context: str, semantic_context: str = ""):
+    def __init__(self, model, schema_context: str, semantic_context: str = "", federated: bool = False):
         self.model = model
         self.schema = schema_context
         self.semantic_context = semantic_context
+        self.federated = federated
 
-    def investigate(self, user_prompt: str, original_sql: str, df: pd.DataFrame, engine):
+    def investigate(self, user_prompt: str, original_sql: str, df: pd.DataFrame, engine, fed_engine=None):
         """
         Generates 2-3 diagnostic slice queries, validates them via SQLGuardrail,
         executes them, and synthesizes a root-cause attribution briefing.
@@ -523,8 +597,9 @@ class RootCauseAgent:
         if not self.model:
             return [], "Gemini API client is not initialized."
 
+        target_dialect = "duckdb" if self.federated else "postgres"
         plan_prompt = f"""You are a Senior Root-Cause Data Analyst.
-Database Schema:
+Available Schema:
 {self.schema}
 
 Semantic Business Rules:
@@ -535,7 +610,7 @@ Original SQL: {original_sql}
 Primary Result Preview:
 {df.head(5).to_string(index=False)}
 
-Task: Propose 2 to 3 diagnostic PostgreSQL SELECT queries to explain *why* the primary result looks the way it does (e.g., slicing by Country, Product Description, CustomerID, or comparing cancellations/outliers).
+Task: Propose 2 to 3 diagnostic SELECT queries to explain *why* the primary result looks the way it does (e.g., slicing by Country, Product Description, CustomerID, or comparing cancellations/outliers).
 Return ONLY a valid JSON array of objects with exact keys:
 [
   {{"dimension": "Short label of what is being sliced", "sql": "SELECT ..."}}
@@ -555,9 +630,9 @@ Limit each query to at most 10 rows. Do not wrap in markdown fences.
             for item in queries[:3]:
                 dim = item.get("dimension", "Diagnostic Slice")
                 raw_sql = item.get("sql", "").strip()
-                sanitized_sql, err = SQLGuardrail.validate_and_sanitize(raw_sql, target_dialect="postgres")
+                sanitized_sql, err = SQLGuardrail.validate_and_sanitize(raw_sql, target_dialect=target_dialect)
                 if not err:
-                    slice_df, db_err = execute_query(engine, sanitized_sql)
+                    slice_df, db_err = execute_query(engine, sanitized_sql, fed_engine=fed_engine)
                     if not db_err and slice_df is not None and not slice_df.empty:
                         diagnostic_results.append({
                             "dimension": dim,
@@ -593,7 +668,7 @@ Summarize the top 2-3 concrete drivers explaining the original result. Quantify 
             return diagnostic_results, f"Synthesis error: {str(e)}"
 
 # ---------------------------------------------------------
-# UI Helper for Confidence & Assumptions
+# UI Helpers (Metadata Badge & Executive Brief Builder)
 # ---------------------------------------------------------
 def render_query_metadata(meta: dict):
     if not meta:
@@ -607,6 +682,41 @@ def render_query_metadata(meta: dict):
         with st.expander("Semantic Rules & Assumptions Applied", expanded=False):
             for item in assumptions:
                 st.markdown(f"- {item}")
+
+
+def build_executive_brief(msg: dict) -> str:
+    lines = [
+        "# AI Data Studio — Executive Analytical Brief",
+        f"**Question:** {msg.get('question', 'N/A')}",
+        "",
+    ]
+
+    meta = msg.get("meta", {})
+    if meta:
+        lines.append(f"**Query Confidence:** {meta.get('confidence', 'Medium')}")
+        assumptions = meta.get("assumptions", [])
+        if assumptions:
+            lines.append("**Semantic Rules & Assumptions Applied:**")
+            for a in assumptions:
+                lines.append(f"- {a}")
+        lines.append("")
+
+    if msg.get("sql"):
+        lines.extend(["## Executed SQL", "```sql", msg["sql"], "```", ""])
+
+    if msg.get("df") is not None and not msg["df"].empty:
+        lines.extend([
+            "## Data Snapshot (Top 10 Rows)",
+            msg["df"].head(10).to_markdown(index=False),
+            "",
+        ])
+
+    lines.extend(["## Analytical Briefing", msg.get("content", ""), ""])
+
+    if "root_cause" in msg and msg["root_cause"].get("brief"):
+        lines.extend(["## Root-Cause Attribution", msg["root_cause"]["brief"], ""])
+
+    return "\n".join(lines)
 
 # ---------------------------------------------------------
 # Session Initialization
@@ -623,6 +733,9 @@ gemini_model, model_display_name = initialize_gemini()
 # ---------------------------------------------------------
 # Sidebar Controls
 # ---------------------------------------------------------
+uploaded_files = []
+mask_pii = True
+
 with st.sidebar:
     st.markdown("### ⚡ AI Data Studio")
     st.caption(f"Engine: `{model_display_name}`")
@@ -663,6 +776,16 @@ with st.sidebar:
 
     if st.session_state.db_connected:
         st.markdown("---")
+        st.markdown("#### 📂 Local File Federation")
+        uploaded_files = st.file_uploader(
+            "Drop CSV or Excel to join with SQL",
+            type=["csv", "xlsx"],
+            accept_multiple_files=True,
+        )
+
+        st.markdown("---")
+        mask_pii = st.toggle("🔒 Mask PII Data", value=True)
+
         if st.button("Clear Conversation", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
@@ -685,13 +808,37 @@ if not st.session_state.db_connected:
     )
 else:
     engine = get_db_engine(st.session_state.db_uri)
-    schema_context = fetch_schema_context(engine)
     semantic_layer = SemanticLayer("semantic_layer.json")
 
+    # Configure DuckDB Federation if local files are uploaded
+    fed_engine = None
+    is_federated = False
+    if uploaded_files:
+        fed_engine = FederatedEngine(st.session_state.db_uri)
+        loaded_names = []
+        for f in uploaded_files:
+            try:
+                local_df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+                tbl_name = fed_engine.register_dataframe(f.name, local_df)
+                loaded_names.append(tbl_name)
+            except Exception as e:
+                st.sidebar.error(f"Failed to load {f.name}: {e}")
+        if loaded_names:
+            is_federated = True
+            st.sidebar.success(f"🦆 DuckDB Federated: {', '.join(loaded_names)}")
+
+    # Build schema context (prefix Postgres tables with `pg.` when federated)
+    pg_schema = fetch_schema_context(engine, prefix="pg." if is_federated else "")
+    schema_context = (
+        f"{pg_schema}\n\n{fed_engine.get_uploaded_schema()}"
+        if is_federated
+        else pg_schema
+    )
+
     # Initialize agents
-    sql_agent = SQLAgent(gemini_model, schema_context, semantic_layer.get_prompt_context())
+    sql_agent = SQLAgent(gemini_model, schema_context, semantic_layer.get_prompt_context(), federated=is_federated)
     viz_agent = VisualizationAgent(gemini_model)
-    insight_agent = InsightAgent(gemini_model, schema_context)
+    insight_agent = InsightAgent(gemini_model, schema_context, federated=is_federated)
 
     # Render previous conversation history
     for idx, msg in enumerate(st.session_state.messages):
@@ -701,6 +848,8 @@ else:
             else:
                 if "meta" in msg:
                     render_query_metadata(msg["meta"])
+                if msg.get("masked_cols"):
+                    st.caption(f"🔒 **PII Masking Active:** Redacted `{', '.join(msg['masked_cols'])}`")
                 if "sql" in msg:
                     with st.expander("Executed SQL Query", expanded=False):
                         st.code(msg["sql"], language="sql")
@@ -710,7 +859,7 @@ else:
                     st.plotly_chart(msg["figure"], use_container_width=True)
                 st.markdown(msg["content"])
 
-                # Root-Cause Investigation Trigger / Display
+                # Action Bar: Root-Cause + Executive Brief & CSV Exports
                 if msg.get("df") is not None and not msg["df"].empty:
                     if "root_cause" in msg:
                         with st.expander("🔍 Root-Cause Attribution Brief", expanded=True):
@@ -718,17 +867,47 @@ else:
                             for diag in msg["root_cause"]["slices"]:
                                 st.caption(f"**Slice:** {diag['dimension']}")
                                 st.dataframe(diag["df"], use_container_width=True)
-                    else:
-                        if st.button("🔍 Investigate Root Causes", key=f"rca_{idx}"):
-                            with st.spinner("Running multi-dimensional root-cause analysis..."):
-                                rca_agent = RootCauseAgent(
-                                    gemini_model, schema_context, semantic_layer.get_prompt_context()
-                                )
-                                slices, brief = rca_agent.investigate(
-                                    msg.get("question", ""), msg.get("sql", ""), msg["df"], engine
-                                )
-                                msg["root_cause"] = {"slices": slices, "brief": brief}
-                                st.rerun()
+
+                    act_col1, act_col2, act_col3 = st.columns(3)
+                    with act_col1:
+                        if "root_cause" not in msg:
+                            if st.button("🔍 Investigate Root Causes", key=f"rca_{idx}", use_container_width=True):
+                                with st.spinner("Running multi-dimensional root-cause analysis..."):
+                                    rca_agent = RootCauseAgent(
+                                        gemini_model,
+                                        schema_context,
+                                        semantic_layer.get_prompt_context(),
+                                        federated=is_federated,
+                                    )
+                                    slices, brief = rca_agent.investigate(
+                                        msg.get("question", ""),
+                                        msg.get("sql", ""),
+                                        msg["df"],
+                                        engine,
+                                        fed_engine=fed_engine,
+                                    )
+                                    msg["root_cause"] = {"slices": slices, "brief": brief}
+                                    st.rerun()
+                    with act_col2:
+                        brief_md = build_executive_brief(msg)
+                        st.download_button(
+                            "📄 Export Brief (.md)",
+                            data=brief_md,
+                            file_name=f"executive_brief_{idx}.md",
+                            mime="text/markdown",
+                            key=f"dl_md_{idx}",
+                            use_container_width=True,
+                        )
+                    with act_col3:
+                        csv_data = msg["df"].to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "📊 Export Data (.csv)",
+                            data=csv_data,
+                            file_name=f"query_results_{idx}.csv",
+                            mime="text/csv",
+                            key=f"dl_csv_{idx}",
+                            use_container_width=True,
+                        )
 
     # Chat prompt handler
     user_prompt = st.chat_input("Ask a question about your data...")
@@ -750,6 +929,7 @@ else:
                     user_prompt=user_prompt,
                     engine=engine,
                     history=st.session_state.messages,
+                    fed_engine=fed_engine,
                 )
 
             if sql_err:
@@ -762,6 +942,12 @@ else:
                     st.code(final_sql, language="sql")
 
                 if df is not None and not df.empty:
+                    masked_cols = []
+                    if mask_pii:
+                        df, masked_cols = PIIMasker.mask_dataframe(df)
+                        if masked_cols:
+                            st.caption(f"🔒 **PII Masking Active:** Redacted `{', '.join(masked_cols)}`")
+
                     st.dataframe(df, use_container_width=True)
 
                     # Dynamic Visualizer
@@ -774,18 +960,19 @@ else:
                     insight_placeholder = st.empty()
                     accumulated_insight = ""
 
-                    for chunk in insight_agent.generate_insight_stream(user_prompt, final_sql, df, engine):
+                    for chunk in insight_agent.generate_insight_stream(user_prompt, final_sql, df):
                         accumulated_insight += chunk
                         insight_placeholder.markdown(accumulated_insight + "▌")
                     insight_placeholder.markdown(accumulated_insight)
 
-                    # Commit assistant turn to session state and rerun to render RCA button cleanly
+                    # Commit assistant turn to session state and rerun to render Action Bar cleanly
                     st.session_state.messages.append(
                         {
                             "role": "assistant",
                             "content": accumulated_insight,
                             "sql": final_sql,
                             "meta": sql_meta,
+                            "masked_cols": masked_cols,
                             "df": df,
                             "figure": fig,
                             "question": user_prompt,
@@ -800,6 +987,7 @@ else:
                             "content": "The query executed successfully but returned 0 rows.",
                             "sql": final_sql,
                             "meta": sql_meta,
+                            "masked_cols": [],
                             "df": df,
                             "figure": None,
                             "question": user_prompt,
