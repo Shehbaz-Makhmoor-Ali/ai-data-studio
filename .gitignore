@@ -14,3 +14,6 @@ __pycache__/
 *$py.class
 *.db
 *.csv
+
+chat_history.json
+verified_queries.json
